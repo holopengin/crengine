@@ -403,7 +403,6 @@ struct VertColumnFitChar {
 
 struct VertColumnFitState {
     int used;
-    int space_reduce_width;
     int prev_class;
     int prev_cjk_class;
 };
@@ -508,7 +507,6 @@ static VertWordLayoutInfo getVerticalWordLayoutInfo( LVFormatter* fmt, formatted
 
 static inline void resetVerticalColumnFitState( VertColumnFitState & state ) {
     state.used = 0;
-    state.space_reduce_width = 0;
     state.prev_class = 0;       // xkanjiskip tracker: 0 none, +1 non-CJK, -1 CJK
     state.prev_cjk_class = -1;  // JFM-glue tracker: JFM class of last CJK char
 }
@@ -558,13 +556,11 @@ static int addVerticalColumnFitChar( VertColumnFitState & state,
     if ( !item.object &&
            ( (state.prev_class == +1 && item.cjk) || (state.prev_class == -1 && !item.cjk) ) ) {
         effective_advance += item.em / 4;
-        state.space_reduce_width += item.em / 8; // xkanjiskip shrink = .125em
     }
     if ( item.cjk && state.prev_cjk_class >= 0 ) {
         JLReqVertGlueSpec spec = getJLReqVertGlueSpec(
                 (JLReqVertClass)state.prev_cjk_class, item.jfm_class);
         effective_advance += vertEighthsToPx(item.em, spec.base_eighths);
-        state.space_reduce_width += vertEighthsToPx(item.em, spec.shrink_eighths);
     }
 
     state.used += effective_advance;
@@ -1216,7 +1212,6 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
         // the text alignment to use with all added lines.
         src_text_fragment_t * para = &fmt->m_pbuffer->srctext[start];
         const int alignment = para->flags & LTEXT_FLAG_NEWLINE;
-        const bool can_shrink_for_justification = alignment == LTEXT_ALIGN_WIDTH;
 
         // detect case with inline preformatted text inside block with line feeds
         bool preFormattedOnly = true;
@@ -1321,14 +1316,6 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
             if ( maxHeight <= 0 )
                 maxHeight = fullHeight;
 
-            if ( fmt->m_flags[pos] & LCHAR_IS_CLUSTER_TAIL && pos > 0 ) {
-                int bpos = pos - 1;
-                while ( bpos > 0 && fmt->m_flags[bpos] & LCHAR_IS_CLUSTER_TAIL )
-                    bpos--;
-                int cluster_width = (fmt->m_advance[bpos] - (bpos > 0 ? fmt->m_advance[bpos-1] : 0));
-                fit.space_reduce_width -= cluster_width;
-            }
-
             // Find candidates where end of line is possible
             bool seen_non_collapsed_space = false;
             bool seen_first_rendered_char = false;
@@ -1376,10 +1363,7 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                     // For vertical: images/inline-boxes that are too tall for page_height
                     // are handled by addLineVertical (Step 2).
                 }
-                // CJK<->non-CJK boundary spacing (xkanjiskip) is no longer reserved
-                // here via fit.space_reduce_width: fit.used below adds the same 0.25em
-                // that Draw inserts, at every such boundary, so this is now folded
-                // into the single faithful column-depth estimate (issue #17).
+                // The fit estimate includes the spacing drawn at CJK/non-CJK boundaries.
 
                 bool grabbedExceedingSpace = false;
                 // Two-part break check:
@@ -1403,13 +1387,9 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                 // old two-part test (m_advance for the real advance + an "every char = one
                 // em" safety estimate); that estimate over-counted narrow Latin and half-em
                 // punctuation, breaking mixed CJK/Latin columns early (issue #17).
-                // Phase-5 JFM/xkanjiskip shrink is applied only by justified
-                // alignment.  Letting left/center/right aligned columns borrow
-                // that capacity makes wrapping retain characters whose actual
-                // draw slots are beyond clip.bottom (issue #74).
-                int fitSpaceReduceWidth = can_shrink_for_justification && y <= 0
-                        ? fit.space_reduce_width : 0;
-                if ( y + fit.used > maxHeight + fitSpaceReduceWidth ) {
+                // Wrap against the drawn depth. A potential justification shrink
+                // is not guaranteed at draw time and can hide the last glyph.
+                if ( y + fit.used > maxHeight ) {
                     // burasagari / end-of-line punctuation hanging: if the overflowing character is
                     // a sentence-end punctuation that must not start a new column (line-start kinsoku),
                     // include it in the current column and stop here.  The glyph will draw
@@ -1418,7 +1398,7 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                     // trailing blank of the em-square may be clipped at clip.bottom.
                     if ( fmt->m_hanging_punctuation && isVerticalHangingChar(fmt->m_text[i]) ) {
                         int prev_adv = fit.used - eff_adv;
-                        if ( y + prev_adv <= maxHeight + fitSpaceReduceWidth ) {
+                        if ( y + prev_adv <= maxHeight ) {
                             ltext_vert_hanging_layout_count++;
                             lastNormalWrap = i;  // include this char in current column
                             i++;
@@ -1437,7 +1417,7 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                                 if ( wa8 < 0 )
                                     wa8 = -wa8;
                                 w = w * wa8 / 8;
-                                if ( y + fmt->m_advance[i-1]-w0 + w <= maxHeight + fitSpaceReduceWidth ) {
+                                if ( y + fmt->m_advance[i-1]-w0 + w <= maxHeight ) {
                                     does_fit = true;
                                 }
                                 if ( !does_fit ) {
@@ -1447,7 +1427,7 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                                         if ( wa8 < 0 )
                                             wa8 = -wa8;
                                         w = w * wa8 / 8;
-                                        if ( y + fmt->m_advance[i-1]-w0 + w <= maxHeight + fitSpaceReduceWidth ) {
+                                        if ( y + fmt->m_advance[i-1]-w0 + w <= maxHeight ) {
                                             does_fit = true;
                                         }
                                     }
@@ -1464,7 +1444,6 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                                     w = w * wa8 / 8;
                                 }
                             }
-                            fit.space_reduce_width += w;
                             cjkReduceWidth -= w;
                             does_fit = true;
                         }
@@ -1525,16 +1504,7 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                     lastNormalWrap = i;
                     col_used_est_at_normal_wrap = fit.used;
                 }
-                if ( !grabbedExceedingSpace &&
-                        fmt->m_pbuffer->min_space_condensing_percent != 100 &&
-                        i < fmt->m_length-1 &&
-                        ( fmt->m_flags[i] & LCHAR_IS_SPACE ) && !( fmt->m_flags[i] & LCHAR_LOCKED_SPACING ) &&
-                        !(fmt->m_flags[i+1] & LCHAR_IS_SPACE) ) {
-                    int dw = getMaxCondensedSpaceTruncation(fmt,i);
-                    if ( dw>0 )
-                        fit.space_reduce_width += dw;
-                }
-                else if ( fmt->m_flags[i] & LCHAR_IS_FLEXIBLE_WIDTH_CJK ) {
+                if ( fmt->m_flags[i] & LCHAR_IS_FLEXIBLE_WIDTH_CJK ) {
                     bool can_add_space_before, can_add_space_after;
                     int wa8 = fmt->getFlexibleCJKWidthAdjustment(i, pos, fmt->m_length, can_add_space_before, can_add_space_after);
                     if ( wa8 != 8 ) {
@@ -1542,10 +1512,6 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
                             wa8 = -wa8;
                             int w = (fmt->m_advance[i] - (i > 0 ? fmt->m_advance[i-1] : 0));
                             cjkReduceWidth += w - (w * wa8 / 8);
-                        }
-                        else if ( wa8 > 0 ) {
-                            int w = (fmt->m_advance[i] - (i > 0 ? fmt->m_advance[i-1] : 0));
-                            fit.space_reduce_width += w - (w * wa8 / 8);
                         }
                     }
                 }
@@ -1576,8 +1542,7 @@ void processParagraphVertical( LVFormatter* fmt, int start, int end, bool isLast
             // Hyphenation
             tryHyphenBreak(fmt, pos, wordpos, lastNormalWrap, lastMandatoryWrap,
                            y, w0, maxHeight,
-                           can_shrink_for_justification && y <= 0
-                               ? fit.space_reduce_width : 0,
+                           0,
                            unusedPercent, lastHyphWrap);
 
             // Decide best position to end this line
