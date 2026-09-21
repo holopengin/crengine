@@ -1698,6 +1698,29 @@ public:
         return _nextFallbackFont;
     }
 
+    /// Fork-only: FE-form substitution resolved through the fallback chain,
+    /// for the non-HarfBuzz (LIGHT/FT) measure/draw paths. Finds the first
+    /// face covering `ch` and substitutes only if that same face has the FE
+    /// form — mirroring the per-face discipline of the HarfBuzz path, where
+    /// .notdef fallback re-runs substitution on each face. (Checking only
+    /// _face would wrongly decline whenever CJK comes from a fallback font.)
+    lChar32 substVertFormChain(lChar32 ch, bool is_vertical) {
+        if (!is_vertical)
+            return ch;
+        lChar32 v = getVertPresentationForm(ch);
+        if (v == ch)
+            return ch;
+        if (FT_Get_Char_Index(_face, ch) != 0)
+            return substVertPresentationForm(_face, ch, true);
+        for (LVFontRef fb = getFallbackFont(); !fb.isNull();
+                fb = ((LVFreeTypeFace*)fb.get())->getNextFallbackFont()) {
+            LVFreeTypeFace *ffb = (LVFreeTypeFace*)fb.get();
+            if (FT_Get_Char_Index(ffb->_face, ch) != 0)
+                return substVertPresentationForm(ffb->_face, ch, true);
+        }
+        return ch;
+    }
+
     LVFontRef getVisuallyAdjustedOtherFont( LVFontRef other_font ) {
         if ( other_font.isNull() )
             return other_font;
@@ -3045,11 +3068,7 @@ public:
             // when the font cmap actually contains the FE-form glyph (LuaTeX-ja
             // line 996: `if t.characters[v]`).
             auto subst_for_vert = [&](lChar32 ch) -> lChar32 {
-                if (!is_vertical_subst) return ch;
-                lChar32 v = getVertPresentationForm(ch);
-                if (v != ch && FT_Get_Char_Index(_face, v) != 0)
-                    return v;
-                return ch;
+                return substVertPresentationForm(_face, ch, is_vertical_subst);
             };
             if ( has_fallback_font ) { // It has a fallback font, add chars as-is
                 for (i = 0; i < len; i++) {
@@ -3463,6 +3482,8 @@ public:
             struct LVCharTriplet triplet;
             struct LVCharPosInfo posInfo;
             triplet.Char = 0;
+            // Fork-only: vertical FE-form substitution (no full HarfBuzz needed).
+            bool is_vertical_lt = (hints & LFNT_HINT_IS_VERTICAL) != 0;
             for ( i=0; i<len; i++) {
                 lChar32 ch = text[i];
                 bool isHyphen = (ch==UNICODE_SOFT_HYPHEN_CODE);
@@ -3476,9 +3497,9 @@ public:
                 }
                 flags[i] = GET_CHAR_FLAGS(ch); //calcCharFlags( ch );
                 triplet.prevChar = triplet.Char;
-                triplet.Char = ch;
+                triplet.Char = substVertFormChain(ch, is_vertical_lt);
                 if (i < len - 1)
-                    triplet.nextChar = text[i + 1];
+                    triplet.nextChar = substVertFormChain(text[i + 1], is_vertical_lt);
                 else
                     triplet.nextChar = 0;
                 if (!_width_cache2.get(triplet, posInfo)) {
@@ -3519,6 +3540,8 @@ public:
         #if (ALLOW_KERNING==1)
         int use_kerning = _kerningMode != KERNING_MODE_DISABLED && FT_HAS_KERNING( _face );
         #endif
+        // Fork-only: vertical FE-form substitution (no HarfBuzz needed).
+        bool is_vertical_ftm = (hints & LFNT_HINT_IS_VERTICAL) != 0;
         for ( i=0; i<len; i++) {
             lChar32 ch = text[i];
             bool isHyphen = (ch==UNICODE_SOFT_HYPHEN_CODE);
@@ -3530,6 +3553,10 @@ public:
                 lastFitChar = i + 1;
                 continue;
             }
+            // FE-forms classify identically to their bases under GET_CHAR_FLAGS
+            // (both yield 0), so substituting before flags/lookup is safe.
+            // Chain-aware: CJK often comes from a fallback face.
+            ch = substVertFormChain(ch, is_vertical_ftm);
             FT_UInt ch_glyph_index = (FT_UInt)-1;
             int kerning = 0;
             #if (ALLOW_KERNING==1)
@@ -4486,11 +4513,7 @@ public:
             // when the font has it.
             bool is_vertical_subst_d = (flags & LFNT_HINT_IS_VERTICAL) != 0;
             auto subst_for_vert_d = [&](lChar32 ch) -> lChar32 {
-                if (!is_vertical_subst_d) return ch;
-                lChar32 v = getVertPresentationForm(ch);
-                if (v != ch && FT_Get_Char_Index(_face, v) != 0)
-                    return v;
-                return ch;
+                return substVertPresentationForm(_face, ch, is_vertical_subst_d);
             };
             if ( has_fallback_font ) { // It has a fallback font, add chars as-is
                 for (i = 0; i < len; i++) {
@@ -5236,6 +5259,8 @@ public:
             struct LVCharPosInfo posInfo;
             triplet.Char = 0;
             bool is_rtl = (flags & LFNT_HINT_DIRECTION_KNOWN) && (flags & LFNT_HINT_DIRECTION_IS_RTL);
+            // Fork-only: vertical orientation for the LIGHT draw path.
+            bool is_vertical_ltd = (flags & LFNT_HINT_IS_VERTICAL) != 0;
             for ( i=0; i<=len; i++) {
                 if ( i==len && !addHyphen )
                     break;
@@ -5251,6 +5276,10 @@ public:
                     ch = getHyphChar();
                     isHyphen = false; // an hyphen, but not one to not draw
                 }
+                // Fork-only: vertical FE-form substitution (no full HarfBuzz needed).
+                // Chain-aware: CJK often comes from a fallback face.
+                if (!isHyphen)
+                    ch = substVertFormChain(ch, is_vertical_ltd);
                 if ( svg_collector ) {
                     triplet.prevChar = triplet.Char;
                     triplet.Char = ch;
@@ -5333,9 +5362,22 @@ public:
                             x += (posInfo.width * cjk_width_scale_percent / 100 - posInfo.width) / 2;
                             cjk_dx = x0 + width - x - posInfo.width;
                         }
-                        drawGlyphItem(buf, x + item->origin_x + posInfo.offset,
-                            y + _baseline - item->origin_y,
-                            item, palette);
+                        // Fork-only: 90°-CW rotation fallback for vertical text
+                        // (dashes, leaders, Latin...) when the font provides no
+                        // +vert substitution — mirrors the HarfBuzz-path fallback
+                        // so good/fast/off render the same orientation as best.
+                        // (Centre-preserving: rotated bitmap keeps the same
+                        // visual centre as the upright draw position.)
+                        if (is_vertical_ltd && needsVerticalRotation90CW(ch)
+                                && item->bmp_pixelformat != 4)
+                            drawGlyphItemRotated90CW(buf,
+                                x + item->origin_x + posInfo.offset,
+                                y + _baseline - item->origin_y,
+                                item, palette);
+                        else
+                            drawGlyphItem(buf, x + item->origin_x + posInfo.offset,
+                                y + _baseline - item->origin_y,
+                                item, palette);
                         // Assume zero advance means it's a diacritic, and we should not apply
                         // any letter spacing on this char (now, and when justifying)
                         if ( posInfo.width != 0 )
@@ -5355,6 +5397,8 @@ public:
         int use_kerning = _kerningMode != KERNING_MODE_DISABLED && FT_HAS_KERNING( _face );
         #endif
         bool is_rtl = (flags & LFNT_HINT_DIRECTION_KNOWN) && (flags & LFNT_HINT_DIRECTION_IS_RTL);
+        // Fork-only: vertical orientation for the FT draw path.
+        bool is_vertical_ftd = (flags & LFNT_HINT_IS_VERTICAL) != 0;
         for ( i=0; i<=len; i++) {
             if ( i==len && !addHyphen )
                 break;
@@ -5380,6 +5424,10 @@ public:
                 ch = getHyphChar();
                 isHyphen = false; // an hyphen, but not one to not draw
             }
+            // Fork-only: vertical FE-form substitution (no HarfBuzz needed).
+            // Chain-aware: CJK often comes from a fallback face.
+            if (!isHyphen)
+                ch = substVertFormChain(ch, is_vertical_ftd);
             FT_UInt ch_glyph_index = getCharIndex( ch, def_char );
             int kerning = 0;
             #if (ALLOW_KERNING==1)
@@ -5458,9 +5506,22 @@ public:
                         x += (w * cjk_width_scale_percent / 100 - w) / 2;
                         w = x0 + width - x;
                     }
-                    drawGlyphItem(buf, x + FONT_METRIC_TO_PX(kerning) + item->origin_x,
-                        y + _baseline - item->origin_y,
-                        item, palette);
+                    // Fork-only: 90°-CW rotation fallback for vertical text
+                    // (dashes, leaders, Latin...) when the font provides no
+                    // +vert substitution — mirrors the HarfBuzz-path fallback
+                    // so off/fast render the same orientation as best.
+                    // (Centre-preserving: rotated bitmap keeps the same
+                    // visual centre as the upright draw position.)
+                    if (is_vertical_ftd && needsVerticalRotation90CW(ch)
+                            && item->bmp_pixelformat != 4)
+                        drawGlyphItemRotated90CW(buf,
+                            x + FONT_METRIC_TO_PX(kerning) + item->origin_x,
+                            y + _baseline - item->origin_y,
+                            item, palette);
+                    else
+                        drawGlyphItem(buf, x + FONT_METRIC_TO_PX(kerning) + item->origin_x,
+                            y + _baseline - item->origin_y,
+                            item, palette);
 
                     // Assume zero advance means it's a diacritic, and we should not apply
                     // any letter spacing on this char (now, and when justifying)

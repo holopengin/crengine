@@ -409,6 +409,16 @@ lChar32 getVertPresentationForm(lChar32 c)
     }
 }
 
+lChar32 substVertPresentationForm(FT_Face face, lChar32 ch, bool is_vertical)
+{
+    if (!is_vertical)
+        return ch;
+    lChar32 v = getVertPresentationForm(ch);
+    if (v != ch && FT_Get_Char_Index(face, v) != 0)
+        return v;
+    return ch;
+}
+
 static inline JLReqVertGlueSpec jfmGlue(int base, int stretch, int shrink,
                                         int priority=0, bool kanjiskip_stretch=false,
                                         bool kanjiskip_shrink=false, bool kern=false)

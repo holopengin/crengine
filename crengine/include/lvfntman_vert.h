@@ -206,6 +206,15 @@ int getJLReqVertCwa(lChar32 c, int em_px, int vadv_px);
 // since this header has no FT_Face dependency.
 lChar32 getVertPresentationForm(lChar32 c);
 
+// Fork-only: FE-form substitution shared by the HarfBuzz AND the non-HarfBuzz
+// (LIGHT/FT) measure/draw paths.  Returns the vertical presentation form of
+// `ch` when `is_vertical` and the font cmap contains it, else `ch` unchanged.
+// Cheap (table lookup + cmap check), no shaping — this is what keeps vertical
+// punctuation correct under kerning modes off/fast/good without paying for
+// full HarfBuzz.  Dashes/leaders are NOT covered here (same omission as
+// getVertPresentationForm): they need +vrt2 or the 90°-rotation fallback.
+lChar32 substVertPresentationForm(FT_Face face, lChar32 ch, bool is_vertical);
+
 // JFM inter-class glue in eighths of em.
 //
 // Implements LuaTeX-ja jfm-ujisv.lua [prev].glue[next] values
