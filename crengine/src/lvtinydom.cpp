@@ -135,7 +135,11 @@ extern const int gDOMVersionCurrent = DOM_VERSION_CURRENT;
 //         extents for orthogonal spacers and images in mixed-content lines.
 //         These alter word positions, line dimensions and parent auto sizing;
 //         old cached formatted geometry must be discarded.
-#define FORMATTING_VERSION_ID 0x0050
+// 0x0051: non-HarfBuzz (off/fast/good) vertical measure substitutes FE forms
+//         and draw reads vmtx through the fallback chain, so word widths and
+//         glyph positions now track kerning=best; old cached formatted
+//         geometry must be discarded.
+#define FORMATTING_VERSION_ID 0x0051
 
 #ifndef DOC_DATA_COMPRESSION_LEVEL
 /// data compression level (0=no compression, 1=fast compressions, 3=normal compression)

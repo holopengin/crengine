@@ -1698,6 +1698,45 @@ public:
         return _nextFallbackFont;
     }
 
+    /// Fork-only: FE-form substitution through the fallback chain, for the
+    /// non-HarfBuzz (LIGHT/FT) measure/draw paths.  Resolves `ch` to the
+    /// first face covering it and substitutes only if that face has the FE
+    /// form, mirroring the HarfBuzz path's per-face .notdef fallback.
+    lChar32 substVertFormChain(lChar32 ch, bool is_vertical) {
+        if (!is_vertical)
+            return ch;
+        lChar32 v = getVertPresentationForm(ch);
+        if (v == ch)
+            return ch;
+        if (FT_Get_Char_Index(_face, ch) != 0)
+            return substVertPresentationForm(_face, ch, true);
+        for (LVFontRef fb = getFallbackFont(); !fb.isNull();
+                fb = ((LVFreeTypeFace*)fb.get())->getNextFallbackFont()) {
+            LVFreeTypeFace *ffb = (LVFreeTypeFace*)fb.get();
+            if (FT_Get_Char_Index(ffb->_face, ch) != 0)
+                return substVertPresentationForm(ffb->_face, ch, true);
+        }
+        return ch;
+    }
+
+    /// Fork-only: read ch's vmtx through the face that actually covers it
+    /// (primary, then the fallback chain; CJK glyphs usually come from a
+    /// fallback face).  Querying only _face would silently drop to the
+    /// no-vmtx fallback, diverging from the HarfBuzz path.
+    bool getVertMetricsForChar(lChar32 ch, VertGlyphMetrics & vm_out) {
+        FT_UInt g = FT_Get_Char_Index(_face, ch);
+        if (g && _vert_metrics_cache.get(_face, g, vm_out))
+            return true;
+        for (LVFontRef fb = getFallbackFont(); !fb.isNull();
+                fb = ((LVFreeTypeFace*)fb.get())->getNextFallbackFont()) {
+            LVFreeTypeFace *ffb = (LVFreeTypeFace*)fb.get();
+            g = FT_Get_Char_Index(ffb->_face, ch);
+            if (g && ffb->_vert_metrics_cache.get(ffb->_face, g, vm_out))
+                return true;
+        }
+        return false;
+    }
+
     LVFontRef getVisuallyAdjustedOtherFont( LVFontRef other_font ) {
         if ( other_font.isNull() )
             return other_font;
@@ -3045,11 +3084,7 @@ public:
             // when the font cmap actually contains the FE-form glyph (LuaTeX-ja
             // line 996: `if t.characters[v]`).
             auto subst_for_vert = [&](lChar32 ch) -> lChar32 {
-                if (!is_vertical_subst) return ch;
-                lChar32 v = getVertPresentationForm(ch);
-                if (v != ch && FT_Get_Char_Index(_face, v) != 0)
-                    return v;
-                return ch;
+                return substVertPresentationForm(_face, ch, is_vertical_subst);
             };
             if ( has_fallback_font ) { // It has a fallback font, add chars as-is
                 for (i = 0; i < len; i++) {
@@ -3463,6 +3498,8 @@ public:
             struct LVCharTriplet triplet;
             struct LVCharPosInfo posInfo;
             triplet.Char = 0;
+            // Fork-only: vertical FE-form substitution (table + cmap, no shaping).
+            bool is_vertical_lt = (hints & LFNT_HINT_IS_VERTICAL) != 0;
             for ( i=0; i<len; i++) {
                 lChar32 ch = text[i];
                 bool isHyphen = (ch==UNICODE_SOFT_HYPHEN_CODE);
@@ -3476,9 +3513,9 @@ public:
                 }
                 flags[i] = GET_CHAR_FLAGS(ch); //calcCharFlags( ch );
                 triplet.prevChar = triplet.Char;
-                triplet.Char = ch;
+                triplet.Char = substVertFormChain(ch, is_vertical_lt);
                 if (i < len - 1)
-                    triplet.nextChar = text[i + 1];
+                    triplet.nextChar = substVertFormChain(text[i + 1], is_vertical_lt);
                 else
                     triplet.nextChar = 0;
                 if (!_width_cache2.get(triplet, posInfo)) {
@@ -3519,6 +3556,8 @@ public:
         #if (ALLOW_KERNING==1)
         int use_kerning = _kerningMode != KERNING_MODE_DISABLED && FT_HAS_KERNING( _face );
         #endif
+        // Fork-only: vertical FE-form substitution (table + cmap, no shaping).
+        bool is_vertical_ftm = (hints & LFNT_HINT_IS_VERTICAL) != 0;
         for ( i=0; i<len; i++) {
             lChar32 ch = text[i];
             bool isHyphen = (ch==UNICODE_SOFT_HYPHEN_CODE);
@@ -3530,6 +3569,10 @@ public:
                 lastFitChar = i + 1;
                 continue;
             }
+            // FE-forms classify identically to their bases under GET_CHAR_FLAGS
+            // (both yield 0), so substituting before flags/lookup is safe.
+            // Chain-aware: CJK often comes from a fallback face.
+            ch = substVertFormChain(ch, is_vertical_ftm);
             FT_UInt ch_glyph_index = (FT_UInt)-1;
             int kerning = 0;
             #if (ALLOW_KERNING==1)
@@ -4463,6 +4506,18 @@ public:
         // not to that post-glyph pen position (whose offset also varies with
         // descendant font-size). Preserve the run origin before shaping.
         int text_origin_y = y;
+        // Fork: render+rotate mode — draw horizontally into a temp buffer,
+        // then rotate 90° CW in the shared blit below.  Hoisted out of the
+        // HarfBuzz branch so the LIGHT (good) and FreeType (off/fast) paths
+        // render Latin-in-vertical identically: they only ever advance x,
+        // which is exactly what the temp buffer wants.
+        int rr_word_w = width;  // horizontal pixel width of the word (passed via width param)
+        int rr_font_h = _height;
+        lUInt8 * rr_buf = NULL;
+        if ( (flags & LFNT_HINT_RENDER_ROTATE_FOR_VERTICAL)
+                && rr_word_w > 0 && rr_font_h > 0 ) {
+            rr_buf = new lUInt8[rr_word_w * rr_font_h]();
+        }
 
     #if USE_HARFBUZZ==1
         if (_kerningMode == KERNING_MODE_HARFBUZZ) {
@@ -4486,11 +4541,7 @@ public:
             // when the font has it.
             bool is_vertical_subst_d = (flags & LFNT_HINT_IS_VERTICAL) != 0;
             auto subst_for_vert_d = [&](lChar32 ch) -> lChar32 {
-                if (!is_vertical_subst_d) return ch;
-                lChar32 v = getVertPresentationForm(ch);
-                if (v != ch && FT_Get_Char_Index(_face, v) != 0)
-                    return v;
-                return ch;
+                return substVertPresentationForm(_face, ch, is_vertical_subst_d);
             };
             if ( has_fallback_font ) { // It has a fallback font, add chars as-is
                 for (i = 0; i < len; i++) {
@@ -4552,14 +4603,6 @@ public:
             // measureText() may have changed it since the last DrawTextString call —
             // but only when the vertical state actually differs (this is a hot path).
             bool is_vert_mark     = (flags & LFNT_HINT_VERTICAL_MARK) != 0;
-            // render+rotate mode: draw horizontally into temp buffer, then rotate 90° CW
-            bool is_render_rotate = (flags & LFNT_HINT_RENDER_ROTATE_FOR_VERTICAL) != 0;
-            int rr_word_w = width;  // horizontal pixel width of the word (passed via width param)
-            int rr_font_h = _height;
-            lUInt8 * rr_buf = NULL;
-            if (is_render_rotate && rr_word_w > 0 && rr_font_h > 0) {
-                rr_buf = new lUInt8[rr_word_w * rr_font_h]();
-            }
             if ( _hb_features_is_vertical != (is_vertical_draw ? 1 : 0) )
                 setupHBFeatures(is_vertical_draw);
 
@@ -5207,35 +5250,14 @@ public:
                 }
             }
 
-            // render+rotate: rotate the temp alpha buffer 90° CW and blit to main buf
-            if (rr_buf) {
-                int rot_w = rr_font_h;
-                // Use the actual horizontal extent drawn (x - x0) instead of rr_word_w
-                // (= word->width = TTB y_advance).  For fonts with vmtx (e.g. NotoSerifJP),
-                // y_advance = full em per glyph so rr_word_w > actual x_advance.  Drawing
-                // only fills the first (x - x0) columns; blitting the full rr_word_w
-                // would append a blank strip after the last glyph, making 'r' appear as a
-                // tiny stub at the edge of the block rather than as a full glyph within it.
-                int actual_w = x - x0;
-                if (actual_w <= 0) actual_w = rr_word_w;  // fallback (empty word, degenerate)
-                int rot_h = actual_w;
-                lUInt8 * rot_buf = new lUInt8[rot_w * rot_h]();
-                for (int ny = 0; ny < rot_h; ny++) {
-                    for (int nx = 0; nx < rot_w; nx++) {
-                        rot_buf[ny * rot_w + nx] = rr_buf[(rr_font_h - 1 - nx) * rr_word_w + ny];
-                    }
-                }
-                buf->Draw(x0, y, rot_buf, rot_w, rot_h, palette);
-                delete[] rot_buf;
-                delete[] rr_buf;
-                rr_buf = NULL;
-            }
         } // _kerningMode == KERNING_MODE_HARFBUZZ
         else if (_kerningMode == KERNING_MODE_HARFBUZZ_LIGHT) {
             struct LVCharTriplet triplet;
             struct LVCharPosInfo posInfo;
             triplet.Char = 0;
             bool is_rtl = (flags & LFNT_HINT_DIRECTION_KNOWN) && (flags & LFNT_HINT_DIRECTION_IS_RTL);
+            // Fork-only: vertical orientation for the LIGHT draw path.
+            bool is_vertical_ltd = (flags & LFNT_HINT_IS_VERTICAL) != 0;
             for ( i=0; i<=len; i++) {
                 if ( i==len && !addHyphen )
                     break;
@@ -5251,6 +5273,13 @@ public:
                     ch = getHyphChar();
                     isHyphen = false; // an hyphen, but not one to not draw
                 }
+                // Class lookups need the source char: capture it before the
+                // FE-form substitution (mirrors getJLReqVertClass(text[])).
+                lChar32 orig_ch = ch;
+                // Fork-only: vertical FE-form substitution (chain-aware: CJK
+                // often comes from a fallback face).
+                if (!isHyphen)
+                    ch = substVertFormChain(ch, is_vertical_ltd);
                 if ( svg_collector ) {
                     triplet.prevChar = triplet.Char;
                     triplet.Char = ch;
@@ -5333,13 +5362,110 @@ public:
                             x += (posInfo.width * cjk_width_scale_percent / 100 - posInfo.width) / 2;
                             cjk_dx = x0 + width - x - posInfo.width;
                         }
-                        drawGlyphItem(buf, x + item->origin_x + posInfo.offset,
-                            y + _baseline - item->origin_y,
-                            item, palette);
+                        // Fork: horizontal draw position; also the temp-buffer
+                        // coordinates for render+rotate words.
+                        int gx = x + item->origin_x + posInfo.offset;
+                        int gy = y + _baseline - item->origin_y;
+                        bool did_rotate = false;
+                        if (is_vertical_ltd) {
+                            // Fork-only: port of the KERNING_MODE_HARFBUZZ
+                            // vertical placement (virtual body / vmtx+cwa), so
+                            // small kana and marks land where kerning=best puts
+                            // them for every font.  The horizontal-bearing
+                            // position (x+origin_x, y+baseline-origin_y) parks
+                            // small ink at the bottom-left of the embox
+                            // whenever the glyph's advance or vmtx origin
+                            // departs from the horizontal assumption.
+                            // JFM class comes from the source char, not its
+                            // FE form — mirrors getJLReqVertClass(text[]) in
+                            // the HarfBuzz path.
+                            lChar32 class_ch = orig_ch;
+                            JLReqVertClass vcls = getJLReqVertClass(class_ch);
+                            bool mark = (flags & LFNT_HINT_VERTICAL_MARK) != 0;
+                            VertGlyphMetrics vm;
+                            bool have_vmtx = getVertMetricsForChar(ch, vm);
+                            int vadv = (have_vmtx && vm.advance)
+                                ? (int)vm.advance : (int)item->advance;
+                            if (vcls == JLREQ_VERT_CJK_BODY && !mark) {
+                                // Virtual body: centre the horizontal advance
+                                // box in the em, then take the TTB origin.
+                                gx = x + (_size - (int)item->advance) / 2
+                                        + item->origin_x;
+                                gy = y + (have_vmtx ? vm.origin_y : 0);
+                            } else if (have_vmtx) {
+                                gx = x + _size / 2 + vm.origin_x;
+                                gy = y + vm.origin_y
+                                    + getJLReqVertCwa(class_ch, _size, vadv);
+                            } else {
+                                // No vmtx: bitmap-centre X, slot-edge Y with
+                                // the JFM cwa shift (HarfBuzz-path fallback).
+                                int cwa = getJLReqVertCwa(class_ch, _size, vadv);
+                                gx = x + (_size - (int)item->bmp_width) / 2;
+                                int em_top = _size - (_height - _baseline);
+                                gy = y + em_top - item->origin_y + cwa;
+                                if (gy < y && cwa >= 0)
+                                    gy = y;
+                            }
+                            if (needsVerticalRotation90CW(ch)
+                                    && item->bmp_pixelformat != 4) {
+                                // Bearing-correct rotation, ported from the
+                                // HarfBuzz path: 90° CW about the em centre
+                                // maps the bearing-placed top-left to
+                                // correct_x/y; drawGlyphItemRotated90CW then
+                                // re-applies the centre adjustment.
+                                int bw = item->bmp_width;
+                                int bh = item->bmp_height;
+                                int correct_x = mark
+                                    ? x + (_size - bh) / 2
+                                    : x + _baseline - item->origin_y;
+                                int correct_y = y + _size - item->origin_x - bw;
+                                if (correct_y < y) correct_y = y;
+                                int rot_gx = correct_x - (bw - bh) / 2;
+                                int rot_gy = correct_y - (bh - bw) / 2;
+                                drawGlyphItemRotated90CW(buf, rot_gx, rot_gy,
+                                        item, palette);
+                                did_rotate = true;
+                            }
+                        }
+                        if (!did_rotate) {
+                            if (rr_buf) {
+                                // render+rotate: composite glyph alpha into
+                                // the temp buffer (horizontal coordinates),
+                                // same blending as the HarfBuzz path.
+                                int tx = gx - x0;
+                                int ty = gy - y;
+                                int bw = item->bmp_width;
+                                int bh = item->bmp_height;
+                                int pitch = item->bmp_pitch > 0 ? item->bmp_pitch : bw;
+                                for (int py = 0; py < bh; py++) {
+                                    int by = ty + py;
+                                    if (by < 0 || by >= rr_font_h) continue;
+                                    for (int px = 0; px < bw; px++) {
+                                        int bx = tx + px;
+                                        if (bx < 0 || bx >= rr_word_w) continue;
+                                        lUInt8 a = item->bmp[py * pitch + px];
+                                        lUInt8 & dst = rr_buf[by * rr_word_w + bx];
+                                        if (a > dst) dst = a;
+                                    }
+                                }
+                            } else {
+                                drawGlyphItem(buf, gx, gy, item, palette);
+                            }
+                        }
                         // Assume zero advance means it's a diacritic, and we should not apply
                         // any letter spacing on this char (now, and when justifying)
-                        if ( posInfo.width != 0 )
-                            x += posInfo.width + letter_spacing + cjk_dx;
+                        if ( posInfo.width != 0 ) {
+                            // Fork-only: in vertical mode the pen advances down
+                            // the column, mirroring the HarfBuzz path's `y += w`,
+                            // so a multi-char upright run (……, ――) stacks instead
+                            // of being drawn side-by-side outside its slot.  The
+                            // step is the same value measureText() summed into
+                            // word->width, keeping draw and layout in lockstep.
+                            if ( is_vertical_ltd )
+                                y += posInfo.width + letter_spacing;
+                            else
+                                x += posInfo.width + letter_spacing + cjk_dx;
+                        }
                     }
                 }
             }
@@ -5355,6 +5481,8 @@ public:
         int use_kerning = _kerningMode != KERNING_MODE_DISABLED && FT_HAS_KERNING( _face );
         #endif
         bool is_rtl = (flags & LFNT_HINT_DIRECTION_KNOWN) && (flags & LFNT_HINT_DIRECTION_IS_RTL);
+        // Fork-only: vertical orientation for the FT draw path.
+        bool is_vertical_ftd = (flags & LFNT_HINT_IS_VERTICAL) != 0;
         for ( i=0; i<=len; i++) {
             if ( i==len && !addHyphen )
                 break;
@@ -5380,6 +5508,13 @@ public:
                 ch = getHyphChar();
                 isHyphen = false; // an hyphen, but not one to not draw
             }
+            // Class lookups need the source char: capture it before the
+            // FE-form substitution (mirrors getJLReqVertClass(text[])).
+            lChar32 orig_ch = ch;
+            // Fork-only: vertical FE-form substitution (chain-aware: CJK
+            // often comes from a fallback face).
+            if (!isHyphen)
+                ch = substVertFormChain(ch, is_vertical_ftd);
             FT_UInt ch_glyph_index = getCharIndex( ch, def_char );
             int kerning = 0;
             #if (ALLOW_KERNING==1)
@@ -5458,14 +5593,93 @@ public:
                         x += (w * cjk_width_scale_percent / 100 - w) / 2;
                         w = x0 + width - x;
                     }
-                    drawGlyphItem(buf, x + FONT_METRIC_TO_PX(kerning) + item->origin_x,
-                        y + _baseline - item->origin_y,
-                        item, palette);
+                    // Fork: horizontal draw position; also the temp-buffer
+                    // coordinates for render+rotate words.
+                    int gx = x + FONT_METRIC_TO_PX(kerning) + item->origin_x;
+                    int gy = y + _baseline - item->origin_y;
+                    bool did_rotate = false;
+                    if (is_vertical_ftd) {
+                        // Fork-only: port of the KERNING_MODE_HARFBUZZ
+                        // vertical placement (virtual body / vmtx+cwa) — see
+                        // the LIGHT path above for the full rationale; the
+                        // class comes from the source char, not its FE form.
+                        lChar32 class_ch = orig_ch;
+                        JLReqVertClass vcls = getJLReqVertClass(class_ch);
+                        bool mark = (flags & LFNT_HINT_VERTICAL_MARK) != 0;
+                        VertGlyphMetrics vm;
+                        bool have_vmtx = getVertMetricsForChar(ch, vm);
+                        int vadv = (have_vmtx && vm.advance)
+                            ? (int)vm.advance : (int)item->advance;
+                        if (vcls == JLREQ_VERT_CJK_BODY && !mark) {
+                            gx = x + (_size - (int)item->advance) / 2
+                                    + item->origin_x;
+                            gy = y + (have_vmtx ? vm.origin_y : 0);
+                        } else if (have_vmtx) {
+                            gx = x + _size / 2 + vm.origin_x;
+                            gy = y + vm.origin_y
+                                + getJLReqVertCwa(class_ch, _size, vadv);
+                        } else {
+                            int cwa = getJLReqVertCwa(class_ch, _size, vadv);
+                            gx = x + (_size - (int)item->bmp_width) / 2;
+                            int em_top = _size - (_height - _baseline);
+                            gy = y + em_top - item->origin_y + cwa;
+                            if (gy < y && cwa >= 0)
+                                gy = y;
+                        }
+                        if (needsVerticalRotation90CW(ch)
+                                && item->bmp_pixelformat != 4) {
+                            // Bearing-correct rotation, ported from the
+                            // HarfBuzz path.
+                            int bw = item->bmp_width;
+                            int bh = item->bmp_height;
+                            int correct_x = mark
+                                ? x + (_size - bh) / 2
+                                : x + _baseline - item->origin_y;
+                            int correct_y = y + _size - item->origin_x - bw;
+                            if (correct_y < y) correct_y = y;
+                            int rot_gx = correct_x - (bw - bh) / 2;
+                            int rot_gy = correct_y - (bh - bw) / 2;
+                            drawGlyphItemRotated90CW(buf, rot_gx, rot_gy,
+                                    item, palette);
+                            did_rotate = true;
+                        }
+                    }
+                    if (!did_rotate) {
+                        if (rr_buf) {
+                            // render+rotate: composite into the temp buffer
+                            // (horizontal coordinates), same as LIGHT/HB.
+                            int tx = gx - x0;
+                            int ty = gy - y;
+                            int bw = item->bmp_width;
+                            int bh = item->bmp_height;
+                            int pitch = item->bmp_pitch > 0 ? item->bmp_pitch : bw;
+                            for (int py = 0; py < bh; py++) {
+                                int by = ty + py;
+                                if (by < 0 || by >= rr_font_h) continue;
+                                for (int px = 0; px < bw; px++) {
+                                    int bx = tx + px;
+                                    if (bx < 0 || bx >= rr_word_w) continue;
+                                    lUInt8 a = item->bmp[py * pitch + px];
+                                    lUInt8 & dst = rr_buf[by * rr_word_w + bx];
+                                    if (a > dst) dst = a;
+                                }
+                            }
+                        } else {
+                            drawGlyphItem(buf, gx, gy, item, palette);
+                        }
+                    }
 
                     // Assume zero advance means it's a diacritic, and we should not apply
                     // any letter spacing on this char (now, and when justifying)
-                    if ( w != 0 )
-                        x += w + letter_spacing;
+                    if ( w != 0 ) {
+                        // Fork-only: vertical pen advances down the column —
+                        // same contract (and same measureText step) as the
+                        // LIGHT path above, mirroring HarfBuzz's `y += w`.
+                        if ( is_vertical_ftd )
+                            y += w + letter_spacing;
+                        else
+                            x += w + letter_spacing;
+                    }
                 }
                 previous = ch_glyph_index;
             }
@@ -5473,6 +5687,33 @@ public:
     #if USE_HARFBUZZ==1
         } // else fallback to the non harfbuzz code
     #endif
+
+        // Fork: shared render+rotate blit — rotate the temp alpha buffer
+        // 90° CW and blit to main buf.  Runs after the kerning-mode
+        // dispatch so every path (HarfBuzz, LIGHT, FreeType) lands Latin-
+        // in-vertical words the same way.
+        if (rr_buf) {
+            int rot_w = rr_font_h;
+            // Use the actual horizontal extent drawn (x - x0) instead of rr_word_w
+            // (= word->width = TTB y_advance).  For fonts with vmtx (e.g. NotoSerifJP),
+            // y_advance = full em per glyph so rr_word_w > actual x_advance.  Drawing
+            // only fills the first (x - x0) columns; blitting the full rr_word_w
+            // would append a blank strip after the last glyph, making 'r' appear as a
+            // tiny stub at the edge of the block rather than as a full glyph within it.
+            int actual_w = x - x0;
+            if (actual_w <= 0) actual_w = rr_word_w;  // fallback (empty word, degenerate)
+            int rot_h = actual_w;
+            lUInt8 * rot_buf = new lUInt8[rot_w * rot_h]();
+            for (int ny = 0; ny < rot_h; ny++) {
+                for (int nx = 0; nx < rot_w; nx++) {
+                    rot_buf[ny * rot_w + nx] = rr_buf[(rr_font_h - 1 - nx) * rr_word_w + ny];
+                }
+            }
+            buf->Draw(x0, y, rot_buf, rot_w, rot_h, palette);
+            delete[] rot_buf;
+            delete[] rr_buf;
+            rr_buf = NULL;
+        }
 
         int advance = x - x0;
         if ( flags & LFNT_DRAW_DECORATION_MASK ) {
