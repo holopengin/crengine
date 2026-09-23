@@ -66,6 +66,7 @@
 #define USE_FREETYPE                         @USE_FREETYPE@
 #define USE_FRIBIDI                          @USE_FRIBIDI@
 #define USE_HARFBUZZ                         @USE_HARFBUZZ@
+#define USE_JUSTICE                          @USE_JUSTICE@
 #define USE_LIBUNIBREAK                      @USE_LIBUNIBREAK@
 #define USE_UTF8PROC                         @USE_UTF8PROC@
 

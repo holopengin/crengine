@@ -14,6 +14,8 @@
 #ifndef LVTEXTFM_FORK_H_INCLUDED
 #define LVTEXTFM_FORK_H_INCLUDED
 
+#include <vector>   // justice_plan_t holds the solver's lines
+
 class LVFormatter;
 
 // Fork-only vertical debug selectors (defined in lvtextfm_vert.cpp).
@@ -248,5 +250,55 @@ static inline bool isRubyInlineBox(ldomNode * node) {
 static inline bool isRubyAnnotId(lUInt16 id) {
     return id == el_rt || id == el_rp || id == el_rtc;
 }
+
+// -----------------------------------------------------------------------------
+// justice: dynamic-programming line breaking and spacing for Latin paragraphs.
+//
+// crengine walks a paragraph greedily, deciding each line's break as soon as
+// the next word no longer fits, and only then spreads the leftover space over
+// the line's gaps.  justice instead solves the whole paragraph at once: it
+// picks the breaks and the per-line spacing together, so it can trade a
+// slightly fuller line here for a much better one three lines down.
+//
+// It is used only as an optimisation of the same contract: a line still only
+// breaks where crengine would have allowed a break, and every line still ends
+// at the same usable width.  Anything crengine cannot model - CJK, vertical
+// text, BiDi, floats, inline boxes, preformatted text, hard newlines - falls
+// back to the greedy walk untouched, so the answer is never worse than it was.
+//
+// Defined in src/lvtextfm_justice.cpp, which lvtextfm.cpp #includes at the
+// bottom (as it already does for lvtextfm_vert.cpp), so it can reach the
+// formatter internals without widening any upstream-visible API.
+// -----------------------------------------------------------------------------
+
+// One line the solver chose, in m_text[] char indices.
+struct justice_line_t {
+    int      char_start;    ///< inclusive: first char of the line
+    int      char_end;      ///< exclusive: first char of the next line, crengine's endp
+    double   word_spacing;  ///< px to add to each gap this line may break at
+    double   tracking;      ///< px to add to each glyph on this line
+};
+
+// The solver's whole-paragraph answer. `valid` is false when the paragraph is
+// not eligible or the solve failed: the caller then uses the greedy walk as
+// if this code did not exist.
+struct justice_plan_t {
+    bool valid;
+    std::vector<justice_line_t> lines;
+};
+
+// Solve `para`'s breaks and spacing. fmt must already have had measureText()
+// called for it, so m_text/m_flags/m_advance describe the whole paragraph.
+// is_css_first_line is rejected rather than handled: the first-line clone
+// sequence breaks the one-line-to-one-position mapping this relies on.
+void justicePlanParagraph( LVFormatter* fmt, src_text_fragment_t * para,
+                           int indent_first, int indent_rest,
+                           bool is_css_first_line, justice_plan_t & plan );
+
+// Put one line's words on the positions the solver asked for, in place, and
+// store the resulting extent in frmline->width. Each word's x is rounded from
+// an unrounded running total, so the error stays under half a pixel however
+// long the line; alignLineHorizontal()'s usual distribution mops that up.
+void justiceApplySpacing( formatted_line_t * frmline, const justice_line_t & line );
 
 #endif // LVTEXTFM_FORK_H_INCLUDED

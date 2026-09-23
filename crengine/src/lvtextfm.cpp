@@ -3042,7 +3042,7 @@ bool LVFormatter::m_libunibreak_init_done = false;
 // share the formatter object without subclassing.
 // -----------------------------------------------------------------------------
     /// align line: add or reduce widths of spaces to achieve desired text alignment
-void alignLineHorizontal( LVFormatter* fmt, formatted_line_t * frmline, int alignment, int rightIndent=0, bool hasInlineBoxes=false ) {
+void alignLineHorizontal( LVFormatter* fmt, formatted_line_t * frmline, int alignment, int rightIndent=0, bool hasInlineBoxes=false, const justice_line_t * jline=NULL ) {
         // Fetch current line x offset and max width
         int x_offset;
         int width = fmt->getAvailableWidthAtY(fmt->m_line_advance, fmt->m_pbuffer->strut_height, x_offset);
@@ -3521,6 +3521,14 @@ void alignLineHorizontal( LVFormatter* fmt, formatted_line_t * frmline, int alig
                 fmt->m_cjk_prev_line_added_space_div = 0;
                 fmt->m_cjk_prev_line_added_space_mod = 0;
             }
+            if ( jline ) {
+                // justice has already decided how far apart this line's words
+                // sit, including the tracking crengine has no word for: apply
+                // that, then re-derive extra_width so the distribution below
+                // only rounds the result off instead of expanding it again.
+                justiceApplySpacing(frmline, *jline);
+                extra_width = usable_width - frmline->width;
+            }
             if ( extra_width > 0
                     && fmt->m_writing_mode != css_wm_vertical_rl
                     && fmt->m_writing_mode != css_wm_vertical_lr ) {
@@ -3588,7 +3596,7 @@ void alignLineHorizontal( LVFormatter* fmt, formatted_line_t * frmline, int alig
 // surrounding horizontal logic stays close to upstream.
 // -----------------------------------------------------------------------------
     /// split line into words, add space for width alignment
-void addLineHorizontal( LVFormatter* fmt, int start, int end, int x, src_text_fragment_t * para, bool first, bool last, bool preFormattedOnly, bool isLastPara, bool hasInlineBoxes )
+void addLineHorizontal( LVFormatter* fmt, int start, int end, int x, src_text_fragment_t * para, bool first, bool last, bool preFormattedOnly, bool isLastPara, bool hasInlineBoxes, const justice_line_t * jline = NULL )
     {
         // No need to do some x-alignment work if light formatting, when we
         // are only interested in computing block height and positioning
@@ -5151,7 +5159,7 @@ void addLineHorizontal( LVFormatter* fmt, int start, int end, int x, src_text_fr
         if ( !light_formatting ) {
             // Fix up words position and width to ensure requested alignment and indent
             prepareVerticalSingleImageLineAlignment(fmt, frmline);
-            alignLineHorizontal( fmt, frmline, align, rightIndent, hasInlineBoxes );
+            alignLineHorizontal( fmt, frmline, align, rightIndent, hasInlineBoxes, jline );
         }
 
         if ( initial_letter_word_index >= 0 ) {
@@ -5408,6 +5416,29 @@ void processParagraphHorizontal( LVFormatter* fmt, int start, int end, bool isLa
         int pos = 0;
 
         bool is_css_first_line = fmt->m_srcs[0] ? (fmt->m_srcs[0]->flags & LTEXT_IS_FIRST_LINE_CLONE) : false;
+
+        // justice: solve this paragraph's breaks and spacing up front, for
+        // plain justified Latin prose only.  plan.valid stays false for
+        // anything else, and the walk below then behaves exactly as it did
+        // before this existed.
+        justice_plan_t justice_plan;
+        {
+            // The walk decides the indent as it goes and then overwrites
+            // m_indent_current, so read both of them before entering it.
+            int indent_first, indent_rest;
+            if ( para->flags & LTEXT_LEGACY_RENDERING ) {
+                indent_first = para->indent > 0 ? para->indent : 0;
+                indent_rest = para->indent > 0 ? 0 : -para->indent;
+            } else {
+                indent_first = fmt->m_indent_current;
+                indent_rest = fmt->m_indent_first_line_done
+                                ? fmt->m_indent_current
+                                : fmt->m_indent_after_first_line;
+            }
+            justicePlanParagraph(fmt, para, indent_first, indent_rest,
+                                 is_css_first_line, justice_plan);
+        }
+        size_t justice_line_index = 0;
 
         #if (USE_LIBUNIBREAK!=1)
         int upSkipPos = -1;
@@ -5949,8 +5980,34 @@ void processParagraphHorizontal( LVFormatter* fmt, int start, int end, bool isLa
             }
 
             // Best position to end this line found.
+            // justice: when the paragraph was solved above, take the break from
+            // the plan instead of the greedy decision.  endp and wrapPos keep
+            // their existing meaning - endp is exclusive, wrapPos is the char
+            // the break happens after - so word splitting, the leading-space
+            // skip and `pos = wrapPos + 1` all keep working unchanged, and a
+            // line still only breaks on a char carrying LCHAR_ALLOW_WRAP_AFTER.
+            const justice_line_t * jline = NULL;
+            if ( justice_plan.valid ) {
+                if ( justice_line_index < justice_plan.lines.size()
+                        && justice_plan.lines[justice_line_index].char_start == pos ) {
+                    const justice_line_t & solved = justice_plan.lines[justice_line_index];
+                    jline = &solved;
+                    endp = solved.char_end;
+                    wrapPos = endp - 1;
+                    justice_line_index++;
+                } else {
+                    // Positions stopped agreeing with the plan - each solved
+                    // line is supposed to set pos to the next one's start, so
+                    // this only happens when something else moved pos (a
+                    // duplicated hyphen, for instance).  Drop the plan rather
+                    // than let two schemes take turns within one paragraph:
+                    // the lines already emitted are still valid breaks, and
+                    // the rest of the paragraph goes back to the greedy walk.
+                    justice_plan.valid = false;
+                }
+            }
             bool hasInlineBoxes = firstInlineBoxPos >= 0 && firstInlineBoxPos < endp;
-            addLineHorizontal( fmt, pos, endp, x, para, pos==0, wrapPos>=fmt->m_length-1, preFormattedOnly, isLastPara, hasInlineBoxes);
+            addLineHorizontal( fmt, pos, endp, x, para, pos==0, wrapPos>=fmt->m_length-1, preFormattedOnly, isLastPara, hasInlineBoxes, jline);
             pos = wrapPos + 1; // start of next line
 
             #if (USE_LIBUNIBREAK==1)
@@ -7587,6 +7644,8 @@ void LFormattedText::Draw( LVDrawBuf * buf, int x, int y, ldomMarkedRangeList * 
 }
 
 
+
+#include "lvtextfm_justice.cpp"
 
 #include "lvtextfm_vert.cpp"
 
