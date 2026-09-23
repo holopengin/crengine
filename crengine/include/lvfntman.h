@@ -241,6 +241,7 @@ enum kerning_mode_t {
 #define LFNT_HINT_CJK_SCALED_WIDTH       0x0400 /// CJK full width glyph has been scaled by cjk_width_scale_percent
 #define LFNT_HINT_RENDER_ROTATE_FOR_VERTICAL 0x0800 /// render text horizontally into temp buffer then rotate 90° CW for vertical column
 #define LFNT_HINT_EXACT_HANGING_DIAG    0x01000000 /// trace exact-boundary hanging punctuation through glyph submission
+#define LFNT_HINT_VERTICAL_LINE_START   0x02000000 /// vertical: first plain word drawn in this column (JLReq 3.1.10 opening-bracket lead-in)
 #define LFNT_HINT_VERTICAL_DECORATION_EDGE 0x8000 /// target_h carries the resolved screen-X edge for vertical decoration
 #define LFNT_HINT_VERTICAL_DECORATION_THICKNESS_SHIFT 16
 #define LFNT_HINT_VERTICAL_DECORATION_THICKNESS_MASK  0x00FF0000 /// decoration owner's line thickness, in px

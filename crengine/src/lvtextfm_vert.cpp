@@ -549,6 +549,16 @@ static VertColumnFitChar getVerticalColumnFitChar( LVFormatter* fmt, int index,
 static int addVerticalColumnFitChar( VertColumnFitState & state,
         const VertColumnFitChar & item ) {
     int effective_advance = item.effective_advance;
+    // Fork: JLReq 3.1.10 — a line-start opening bracket consumes a full em
+    // (whitespace + glyph), mirroring the word->width override in
+    // addLineHorizontal: the break scan must reserve the same depth the
+    // Draw/LAYOUT trackers will advance, or the column over-packs by the
+    // compacted half em.  state.used == 0 marks a column's first fit item
+    // (the state is reset per column), and at line start there is no JFM
+    // glue or xkanjiskip yet, so replacing the value here is exact.
+    if ( state.used == 0 && !item.object
+            && item.jfm_class == JLREQ_VERT_OPEN_BRACKET )
+        effective_advance = item.em;
     // Phase 5 inter-item spacing that Draw inserts but m_advance does not:
     // xkanjiskip at CJK<->non-CJK boundaries and JFM inter-class glue between
     // consecutive CJK chars.  Inline boxes reset the chain because their
@@ -775,7 +785,7 @@ static void syncVerticalInlineBoxPositionsAfterJustify( LVFormatter* fmt,
 // stride consistency (see spec/unit/ruby_position_spec.lua).
 // =============================================================================
 void alignLineHorizontalVerticalPostPass( LVFormatter* fmt, formatted_line_t * frmline,
-        bool hasInlineBoxes, int alignment, int usable_width ) {
+        bool hasInlineBoxes, int alignment, int usable_width, bool last_line) {
     #if MATHML_SUPPORT==1
         lUInt16 needed_baseline = frmline->baseline;
         lUInt16 needed_height = frmline->height;
@@ -989,7 +999,21 @@ void alignLineHorizontalVerticalPostPass( LVFormatter* fmt, formatted_line_t * f
     if ( is_vert_frmline ) {
         if ( vert_layout_min_x > (int)frmline->width )
             frmline->width = (lUInt16)vert_layout_min_x;
-        applyVerticalJustification(frmline, vert_justify_gaps, alignment, usable_width);
+        // Fork: vertical text keeps the monospace em grid.  KOReader's default
+        // epub.css justifies every paragraph, and spreading a non-final
+        // column's leftover across the per-character gaps (fractional amounts
+        // with 1-px minimums) slides characters off the em grid by a different
+        // cumulative amount in every column — the gradual cross-column drift
+        // seen on device.  Vertical columns now justify only the paragraph's
+        // last line and only when the author asked for it (text-align-last:
+        // justify; auto converts justify to start), so an explicit opt-in
+        // keeps working while default-justified columns stay on the grid with
+        // a sub-em ragged bottom.  JFM base glue, xkanjiskip, kinsoku, breaks
+        // and horizontal (upstream) justification are untouched.
+        applyVerticalJustification(frmline, vert_justify_gaps,
+                (last_line && alignment == LTEXT_ALIGN_WIDTH)
+                    ? alignment : LTEXT_ALIGN_LEFT,
+                usable_width);
         if ( hasInlineBoxes )
             syncVerticalInlineBoxPositionsAfterJustify(fmt, frmline);
     }
@@ -2758,6 +2782,12 @@ void applyVerticalWordDraw(
     int prev_end = state.vert_min_next_x;
     int clamped_x = vertClampForward((int)word->x, prev_end);
     y0_out = y + frmline->x + clamped_x;
+    // Fork: JLReq 3.1.10 — flag the column's first plain word so
+    // DrawTextString gives a leading opening bracket its half-em lead-in.
+    // vert_prev_plain_y0 is reset per frmline (-1 = no plain glyph drawn
+    // yet in this column).
+    if ( state.vert_prev_plain_y0 < 0 )
+        drawFlags |= LFNT_HINT_VERTICAL_LINE_START;
     // Advance vert_min_next_x.  Skip the font_size clamp for half-em JFM
     // chars: Phase 3 intentionally sets word->width = em/2 for class
     // [1][2][3][4][7], and clamping would re-introduce a half-em gap.

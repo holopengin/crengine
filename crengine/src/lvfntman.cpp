@@ -3377,12 +3377,14 @@ public:
                             // Glyph found in this font
                             if ( is_vertical ) {
                                 if ( glyph_pos[hg].y_advance )
-                                    // y_advance is negative for TTB; use absolute value for width accumulation
-                                    advance = abs(FONT_METRIC_TO_PX(glyph_pos[hg].y_advance));
+                                    // y_advance is negative for TTB; use absolute value for width accumulation.
+                                    // + _synth_weight_strength mirrors the draw pen exactly (parity).
+                                    advance = abs(FONT_METRIC_TO_PX(glyph_pos[hg].y_advance + _synth_weight_strength));
                                 else if ( glyph_pos[hg].x_advance )
                                     // Font has no vertical metrics (no vmtx table).
-                                    // Fall back to x_advance for vertical layout.
-                                    advance = FONT_METRIC_TO_PX(glyph_pos[hg].x_advance);
+                                    // Fall back to x_advance for vertical layout
+                                    // (+ synth mirrors the draw pen; see below).
+                                    advance = FONT_METRIC_TO_PX(glyph_pos[hg].x_advance + _synth_weight_strength);
                                 // Phase 3 (LuaTeX-ja jfm-ujisv.lua half-em compaction):
                                 // Override font's natural em advance with JFM-specified slot
                                 // width.  Class [1] [2] [3] [4] [7] get em/2; others stay em.
@@ -3416,9 +3418,9 @@ public:
                             // Keep the advance of .notdef/tofu in case there is no fallback font to correct them
                             if ( is_vertical ) {
                                 if ( glyph_pos[hg].y_advance )
-                                    advance = abs(FONT_METRIC_TO_PX(glyph_pos[hg].y_advance));
+                                    advance = abs(FONT_METRIC_TO_PX(glyph_pos[hg].y_advance + _synth_weight_strength));
                                 else if ( glyph_pos[hg].x_advance )
-                                    advance = abs(FONT_METRIC_TO_PX(glyph_pos[hg].x_advance));
+                                    advance = abs(FONT_METRIC_TO_PX(glyph_pos[hg].x_advance + _synth_weight_strength));
                                 if ( advance > 0 && hcl < len )
                                     advance = getJLReqVertSlotWidth(text[hcl], _size, advance);
                             }
@@ -4950,13 +4952,19 @@ public:
                         }
                         // Fork-only: TTB shaping in vertical mode carries the
                         // advance in y_advance (negative, y-up) instead of
-                        // x_advance. Override w with abs(y_advance) when present.
-                        if (is_vertical_draw && glyph_pos[i].y_advance) {
-                            w = abs(FONT_METRIC_TO_PX(glyph_pos[i].y_advance + _synth_weight_strength));
+                        // x_advance. Override w with abs(y_advance) when present;
+                        // faces without vhea/vmtx fall back to x_advance (as
+                        // measureText does) and MUST still get the JFM slot
+                        // override, or draw diverges from measure for every class.
+                        if (is_vertical_draw && (glyph_pos[i].y_advance || glyph_pos[i].x_advance)) {
+                            if (glyph_pos[i].y_advance)
+                                w = abs(FONT_METRIC_TO_PX(glyph_pos[i].y_advance + _synth_weight_strength));
+                            else
+                                w = FONT_METRIC_TO_PX(glyph_pos[i].x_advance + _synth_weight_strength);
                             // Natural vertical advance (before the JLReq slot override).
                             vert_natural_adv = w;
                             lUInt32 ci = glyph_info[i].cluster;
-                            if (ci < (lUInt32)len) {
+                            if (w > 0 && ci < (lUInt32)len) {
                                 if (getJLReqVertClass(text[ci]) == JLREQ_VERT_OTHER) {
                                     hb_position_t h_adv = hb_font_get_glyph_h_advance(
                                         _hb_font, glyph_info[i].codepoint);
@@ -5162,6 +5170,15 @@ public:
                                     } else {
                                         int cwa = getJLReqVertCwa(cluster_char, _size,
                                             vert_natural_adv);
+                                        // Fork: JLReq 3.1.10 line-start lead-in — an
+                                        // opening bracket leading its column starts
+                                        // after half an em of whitespace (ink in the
+                                        // lower half of a full-em line-start cell)
+                                        // instead of carrying the font's vertBearingY
+                                        // + in-slot cwa terms.
+                                        bool line_start_lead_in =
+                                            (flags & LFNT_HINT_VERTICAL_LINE_START)
+                                            && getJLReqVertClass(cluster_char) == JLREQ_VERT_OPEN_BRACKET;
                                         VertGlyphMetrics vm;
                                         if (_vert_metrics_cache.get(_face,
                                                 glyph_info[i].codepoint, vm)) {
@@ -5174,12 +5191,17 @@ public:
                                             // other exceptional vertical glyphs only.
                                             gx = x + (_size - (int)item->bmp_width) / 2;
                                             int em_top = _size - (_height - _baseline);
+                                            // Fork: no HB y_offset term here — per the
+                                            // rule above, TTB offsets must not be
+                                            // added on top of the fork's placement;
+                                            // for vmtx-less faces it is ~0 anyway.
                                             gy = y + em_top - item->origin_y
-                                                 - FONT_METRIC_TO_PX(glyph_pos[i].y_offset)
                                                  + cwa;
                                             if (gy < y && cwa >= 0)
                                                 gy = y;
                                         }
+                                        if (line_start_lead_in)
+                                            gy = y + _size / 2;
                                     }
                                 }
                                 bool did_rotate = false;
@@ -5455,13 +5477,11 @@ public:
                             // vertical placement (virtual body / vmtx+cwa), so
                             // small kana and marks land where kerning=best puts
                             // them for every font.  The horizontal-bearing
-                            // position (x+origin_x, y+baseline-origin_y) parks
-                            // small ink at the bottom-left of the embox
-                            // whenever the glyph's advance or vmtx origin
-                            // departs from the horizontal assumption.
-                            // JFM class comes from the source char, not its
-                            // FE form — mirrors getJLReqVertClass(text[]) in
-                            // the HarfBuzz path.
+                            // position would park small ink at the bottom-left
+                            // of the embox whenever the glyph's advance or vmtx
+                            // origin departs from the horizontal assumption.
+                            // JFM class comes from the source char, not its FE
+                            // form — mirrors getJLReqVertClass(text[]).
                             lChar32 class_ch = orig_ch;
                             JLReqVertClass vcls = getJLReqVertClass(class_ch);
                             bool mark = (flags & LFNT_HINT_VERTICAL_MARK) != 0;
@@ -5490,6 +5510,10 @@ public:
                                 have_vmtx = getVertMetricsForChar(ch, vm);
                             int vadv = (have_vmtx && vm.advance)
                                 ? (int)vm.advance : (int)item->advance;
+                            int cwa = getJLReqVertCwa(class_ch, _size, vadv);
+                            bool line_start_lead_in =
+                                (flags & LFNT_HINT_VERTICAL_LINE_START)
+                                && vcls == JLREQ_VERT_OPEN_BRACKET;
                             if (vcls == JLREQ_VERT_CJK_BODY && !mark) {
                                 // Virtual body: centre the horizontal advance
                                 // box in the em, then take the TTB origin.
@@ -5498,18 +5522,20 @@ public:
                                 gy = y + (have_vmtx ? vm.origin_y : 0);
                             } else if (have_vmtx) {
                                 gx = x + _size / 2 + vm.origin_x;
-                                gy = y + vm.origin_y
-                                    + getJLReqVertCwa(class_ch, _size, vadv);
+                                gy = y + vm.origin_y + cwa;
                             } else {
                                 // No vmtx: bitmap-centre X, slot-edge Y with
                                 // the JFM cwa shift (HarfBuzz-path fallback).
-                                int cwa = getJLReqVertCwa(class_ch, _size, vadv);
                                 gx = x + (_size - (int)item->bmp_width) / 2;
                                 int em_top = _size - (_height - _baseline);
                                 gy = y + em_top - item->origin_y + cwa;
                                 if (gy < y && cwa >= 0)
                                     gy = y;
                             }
+                            // Fork: JLReq 3.1.10 line-start lead-in — ink starts
+                            // after half an em of whitespace (parity with HarfBuzz).
+                            if (line_start_lead_in)
+                                gy = y + _size / 2;
                             // Fork: JFM Phase-3 slot advance (mirrors HarfBuzz) —
                             // this path measured raw horizontal advances, so
                             // half-em classes drifted long lines off the grid.
@@ -5749,22 +5775,28 @@ public:
                             have_vmtx = getVertMetricsForChar(ch, vm);
                         int vadv = (have_vmtx && vm.advance)
                             ? (int)vm.advance : (int)item->advance;
+                        int cwa = getJLReqVertCwa(class_ch, _size, vadv);
+                        bool line_start_lead_in =
+                            (flags & LFNT_HINT_VERTICAL_LINE_START)
+                            && vcls == JLREQ_VERT_OPEN_BRACKET;
                         if (vcls == JLREQ_VERT_CJK_BODY && !mark) {
                             gx = x + (_size - (int)item->advance) / 2
                                     + item->origin_x;
                             gy = y + (have_vmtx ? vm.origin_y : 0);
                         } else if (have_vmtx) {
                             gx = x + _size / 2 + vm.origin_x;
-                            gy = y + vm.origin_y
-                                + getJLReqVertCwa(class_ch, _size, vadv);
+                            gy = y + vm.origin_y + cwa;
                         } else {
-                            int cwa = getJLReqVertCwa(class_ch, _size, vadv);
                             gx = x + (_size - (int)item->bmp_width) / 2;
                             int em_top = _size - (_height - _baseline);
                             gy = y + em_top - item->origin_y + cwa;
                             if (gy < y && cwa >= 0)
                                 gy = y;
                         }
+                        // Fork: JLReq 3.1.10 line-start lead-in (see the
+                        // LIGHT path above).
+                        if (line_start_lead_in)
+                            gy = y + _size / 2;
                         // Fork: JFM Phase-3 slot advance — see the LIGHT path
                         // above for why half-em classes need it.
                         if ( vert_slot_advance > 0

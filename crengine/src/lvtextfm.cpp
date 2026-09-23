@@ -3042,7 +3042,7 @@ bool LVFormatter::m_libunibreak_init_done = false;
 // share the formatter object without subclassing.
 // -----------------------------------------------------------------------------
     /// align line: add or reduce widths of spaces to achieve desired text alignment
-void alignLineHorizontal( LVFormatter* fmt, formatted_line_t * frmline, int alignment, int rightIndent=0, bool hasInlineBoxes=false ) {
+void alignLineHorizontal( LVFormatter* fmt, formatted_line_t * frmline, int alignment, int rightIndent=0, bool hasInlineBoxes=false, bool last_line=false ) {
         // Fetch current line x offset and max width
         int x_offset;
         int width = fmt->getAvailableWidthAtY(fmt->m_line_advance, fmt->m_pbuffer->strut_height, x_offset);
@@ -3572,7 +3572,7 @@ void alignLineHorizontal( LVFormatter* fmt, formatted_line_t * frmline, int alig
         // vertical-mode line (the Phase 5 mirror must run on every vertical
         // line, not just those with ruby — see ruby_position_spec.lua).
         if ( hasInlineBoxes || css_wm_is_vertical(fmt->m_pbuffer->writing_mode) ) {
-            alignLineHorizontalVerticalPostPass( fmt, frmline, hasInlineBoxes, alignment, usable_width );
+            alignLineHorizontalVerticalPostPass( fmt, frmline, hasInlineBoxes, alignment, usable_width, last_line );
         }
     }
 
@@ -4636,6 +4636,21 @@ void addLineHorizontal( LVFormatter* fmt, int start, int end, int x, src_text_fr
                     // Set and adjust word natural width (and min_width which might be used in alignLine())
                     word->width = fmt->m_advance[i>0 ? i-1 : 0] - (wstart>0 ? fmt->m_advance[wstart-1] : 0);
                     word->min_width = word->width;
+                    // Fork: JLReq 3.1.10 — a column-leading opening bracket
+                    // takes a FULL em (whitespace before the glyph, then the
+                    // glyph), so every character after it aligns with the
+                    // other columns; the half-em JFM slot is a mid-line
+                    // compaction that has nothing to tuck against at line
+                    // start.  firstWord is the line's first word (= column
+                    // start in vertical mode); Draw's tracker, the LAYOUT
+                    // post-pass, getRect and the highlight all derive from
+                    // word->width, so this one override keeps them in
+                    // lockstep.
+                    if ( firstWord && is_vertical_mode && word->t.len == 1
+                            && getJLReqVertClass(fmt->m_text[wstart]) == JLREQ_VERT_OPEN_BRACKET ) {
+                        word->width = font->getSize();
+                        word->min_width = word->width;
+                    }
                     TR("addLine - word(%d, %d) x=%d (%d..%d)[%d] |%s|", wstart, i, frmline->width, wstart>0 ? fmt->m_advance[wstart-1] : 0, fmt->m_advance[i-1], word->width, LCSTR(lString32(fmt->m_text+wstart, i-wstart)));
                     if ( is_vertical_mode )
                         applyVerticalTcyWord(fmt, srcline, word, font);
@@ -5151,7 +5166,7 @@ void addLineHorizontal( LVFormatter* fmt, int start, int end, int x, src_text_fr
         if ( !light_formatting ) {
             // Fix up words position and width to ensure requested alignment and indent
             prepareVerticalSingleImageLineAlignment(fmt, frmline);
-            alignLineHorizontal( fmt, frmline, align, rightIndent, hasInlineBoxes );
+            alignLineHorizontal( fmt, frmline, align, rightIndent, hasInlineBoxes, last );
         }
 
         if ( initial_letter_word_index >= 0 ) {

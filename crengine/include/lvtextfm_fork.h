@@ -218,9 +218,11 @@ void applyVerticalWordDraw(
 // Called from alignLineHorizontal() in lvtextfm.cpp for any line that
 // either has inline boxes OR is in vertical writing mode (the Phase 5
 // mirror must run on every vertical line, not just those with ruby).
+// last_line gates vertical justification: only the paragraph's final line
+// justifies (see the em-grid note in lvtextfm_vert.cpp).
 // formatted_line_t is declared in lvtextfm.h; forward via the typedef name.
 void alignLineHorizontalVerticalPostPass( LVFormatter* fmt, formatted_line_t * frmline,
-        bool hasInlineBoxes, int alignment=0, int usable_width=-1 );
+        bool hasInlineBoxes, int alignment=0, int usable_width=-1, bool last_line=false );
 
 // Punctuation helpers (defined in lvtextfm.cpp; used from
 // measureText() in lvtextfm.cpp, which is earlier in the TU).

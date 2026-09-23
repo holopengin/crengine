@@ -4019,7 +4019,10 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
                         // prefer 1em - but let's not bother for now: go with ceiling to get 2em.
                         // But stay on the smaller side if the paragraph width is itself small (it
                         // might be a table cell or a float)
-                        if ( width >= 8*unit ) {
+                        // Fork: vertical keeps the floor (a whole short em for e.g. 1.2em) —
+                        // the ceiling to two ems is a horizontal/clreq-flavoured choice and
+                        // makes vertical first-line indents too long on the JP em grid.
+                        if ( width >= 8*unit && !css_wm_is_vertical(resolveEffectiveWritingMode(enode)) ) {
                             tailored_indent += unit;
                         }
                     }
@@ -4028,6 +4031,20 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
                 if ( is_negative ) {
                     indent = -indent; // (restore it)
                 }
+            }
+            // Fork: in vertical mode keep the first-line indent on the em grid
+            // so paragraphs start in whole embox increments.  Rounds toward
+            // zero (preserves authored magnitude), runs after the CJK-tailored
+            // rounding above (whose results are already whole-em, so this only
+            // snaps the raw lengthToPx floor — e.g. 1.2em at 17px = 20px -> 17px
+            // = 1em).  The indent uses the block font's em, the same base
+            // lengthToPx used; a differently-sized first-word span can still
+            // shift the visual grid.
+            if ( indent != 0 && em > 0 && css_wm_is_vertical(resolveEffectiveWritingMode(enode)) ) {
+                bool is_neg = indent < 0;
+                int ai = is_neg ? -indent : indent;
+                ai = (ai / em) * em;
+                indent = is_neg ? -ai : ai;
             }
             // lvstsheet stores the `hanging` keyword in the low bit.  It changes
             // which lines the indent applies to; it does not change the sign of
