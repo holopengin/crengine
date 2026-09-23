@@ -139,7 +139,11 @@ extern const int gDOMVersionCurrent = DOM_VERSION_CURRENT;
 //         and draw reads vmtx through the fallback chain, so word widths and
 //         glyph positions now track kerning=best; old cached formatted
 //         geometry must be discarded.
-#define FORMATTING_VERSION_ID 0x0051
+// 0x0052: non-HarfBuzz vertical measure/draw apply the JFM Phase-3 slot
+//         override and pick the font's +vert/+vrt2 GSUB glyph, so half-em
+//         classes keep the em grid in every kerning mode; old cached
+//         formatted geometry must be discarded.
+#define FORMATTING_VERSION_ID 0x0052
 
 #ifndef DOC_DATA_COMPRESSION_LEVEL
 /// data compression level (0=no compression, 1=fast compressions, 3=normal compression)

@@ -1737,6 +1737,62 @@ public:
         return false;
     }
 
+#if USE_HARFBUZZ==1
+    /// Fork-only: resolve `shape_ch` to the face covering it (primary, then
+    /// the fallback chain) with its nominal cmap gid and its +vert/+vrt2
+    /// GSUB result.  The non-HarfBuzz vertical draw paths need this because
+    /// they otherwise draw raw cmap glyphs: fonts encode small-kana vertical
+    /// alternates and other upright forms in GSUB alone, so off/fast/good
+    /// would render the horizontal glyph where kerning=best picks the
+    /// vertical one.  Shapes a single char through the covering face's
+    /// existing HB buffer (CJK words are single chars, so this is far below
+    /// full-word shaping cost).  Returns false when no face covers the char.
+    bool resolveVertGsubGlyph(lChar32 shape_ch, LVFreeTypeFace ** face_out,
+            lUInt32 * nominal_out, lUInt32 * vert_out) {
+        *face_out = NULL;
+        *nominal_out = 0;
+        *vert_out = 0;
+        if ( !shape_ch )
+            return false;
+        auto try_face = [&](LVFreeTypeFace * f) -> bool {
+            if ( !f || FT_Get_Char_Index(f->_face, shape_ch) == 0 )
+                return false;
+            hb_codepoint_t nominal = 0;
+            hb_codepoint_t gid = 0;
+            if ( f->_hb_font ) {
+                hb_font_get_glyph(f->_hb_font, (hb_codepoint_t)shape_ch, 0, &nominal);
+                hb_buffer_clear_contents(f->_hb_buffer);
+                hb_buffer_add(f->_hb_buffer, (hb_codepoint_t)shape_ch, 0);
+                hb_buffer_set_content_type(f->_hb_buffer, HB_BUFFER_CONTENT_TYPE_UNICODE);
+                hb_feature_t feats[2];
+                int nf = 0;
+                if ( hb_feature_from_string("+vert", -1, &feats[nf]) ) nf++;
+                if ( hb_feature_from_string("+vrt2", -1, &feats[nf]) ) nf++;
+                hb_buffer_guess_segment_properties(f->_hb_buffer);
+                hb_shape(f->_hb_font, f->_hb_buffer, feats, nf);
+                unsigned int n_info = 0;
+                hb_glyph_info_t * info = hb_buffer_get_glyph_infos(f->_hb_buffer, &n_info);
+                gid = (n_info > 0) ? info[0].codepoint : 0;
+                hb_buffer_reset(f->_hb_buffer);
+            }
+            if ( !nominal )
+                nominal = FT_Get_Char_Index(f->_face, shape_ch);
+            *face_out = f;
+            *nominal_out = (lUInt32)nominal;
+            *vert_out = (lUInt32)(gid ? gid : nominal);
+            return true;
+        };
+        if ( try_face(this) )
+            return true;
+        for (LVFontRef fb = getFallbackFont(); !fb.isNull();
+                fb = ((LVFreeTypeFace*)fb.get())->getNextFallbackFont()) {
+            if ( try_face((LVFreeTypeFace*)fb.get()) )
+                return true;
+        }
+        return false;
+    }
+#endif // USE_HARFBUZZ==1
+
     LVFontRef getVisuallyAdjustedOtherFont( LVFontRef other_font ) {
         if ( other_font.isNull() )
             return other_font;
@@ -3527,7 +3583,20 @@ public:
                         continue;  /* ignore errors */
                     }
                 }
-                widths[i] = prev_width + posInfo.width;
+                int vert_adv = posInfo.width;
+                if ( is_vertical_lt && vert_adv > 0
+                        && getJLReqVertClass(text[i]) != JLREQ_VERT_OTHER ) {
+                    // Fork: JFM Phase-3 slot override, mirroring the HarfBuzz
+                    // branch — this path measured raw horizontal advances, so
+                    // half-em classes accumulated as full ems and long lines
+                    // drifted off the em grid, out of step with kerning=best.
+                    int natural = vert_adv;
+                    VertGlyphMetrics vm;
+                    if ( getVertMetricsForChar(triplet.Char, vm) && vm.advance )
+                        natural = vm.advance;
+                    vert_adv = getJLReqVertSlotWidth(text[i], _size, natural);
+                }
+                widths[i] = prev_width + vert_adv;
                 if ( posInfo.width == 0 ) {
                     // Assume zero advance means it's a diacritic, and we should not apply
                     // any letter spacing on this char (now, and when justifying)
@@ -3622,7 +3691,20 @@ public:
                     ch_glyph_index = getCharIndex( ch, 0 );
                 previous = ch_glyph_index;
             }
-            widths[i] = prev_width + w + FONT_METRIC_TO_PX(kerning);
+            int ft_adv = w + FONT_METRIC_TO_PX(kerning);
+            if ( is_vertical_ftm && ft_adv > 0
+                    && getJLReqVertClass(text[i]) != JLREQ_VERT_OTHER ) {
+                // Fork: JFM Phase-3 slot override (mirrors the HarfBuzz
+                // branch; see the LIGHT measure path) — half-em classes
+                // measured as raw horizontal advances and drifted long
+                // lines off the em grid, out of step with kerning=best.
+                int natural = ft_adv;
+                VertGlyphMetrics vm;
+                if ( getVertMetricsForChar(ch, vm) && vm.advance )
+                    natural = vm.advance;
+                ft_adv = getJLReqVertSlotWidth(text[i], _size, natural);
+            }
+            widths[i] = prev_width + ft_adv;
             if ( w == 0 ) {
                 // Assume zero advance means it's a diacritic, and we should not apply
                 // any letter spacing on this char (now, and when justifying)
@@ -5367,6 +5449,7 @@ public:
                         int gx = x + item->origin_x + posInfo.offset;
                         int gy = y + _baseline - item->origin_y;
                         bool did_rotate = false;
+                        int vert_slot_advance = posInfo.width;
                         if (is_vertical_ltd) {
                             // Fork-only: port of the KERNING_MODE_HARFBUZZ
                             // vertical placement (virtual body / vmtx+cwa), so
@@ -5382,8 +5465,29 @@ public:
                             lChar32 class_ch = orig_ch;
                             JLReqVertClass vcls = getJLReqVertClass(class_ch);
                             bool mark = (flags & LFNT_HINT_VERTICAL_MARK) != 0;
+                            // Fork: pick the font's +vert/+vrt2 GSUB glyph —
+                            // full HarfBuzz does this while shaping; without
+                            // it this path draws the horizontal cmap glyph
+                            // (small-kana vertical alternates etc.), diverging
+                            // from kerning=best.
+                            LVFreeTypeFace * gface = NULL;
+                            lUInt32 gnom = 0, gvert = 0;
+                            bool vert_subst = resolveVertGsubGlyph(ch, &gface, &gnom, &gvert)
+                                    && gvert != gnom;
+                            if ( vert_subst ) {
+                                LVFontGlyphCacheItem * gitem = gface->getGlyphByIndex(gvert);
+                                if (gitem)
+                                    item = gitem;
+                            }
                             VertGlyphMetrics vm;
-                            bool have_vmtx = getVertMetricsForChar(ch, vm);
+                            // vmtx from the substituted glyph when there is one
+                            // (possibly a different face's), else from the face
+                            // covering the source char.
+                            bool have_vmtx = vert_subst
+                                && gface->_vert_metrics_cache.get(
+                                        gface->_face, (FT_UInt)gvert, vm);
+                            if ( !have_vmtx )
+                                have_vmtx = getVertMetricsForChar(ch, vm);
                             int vadv = (have_vmtx && vm.advance)
                                 ? (int)vm.advance : (int)item->advance;
                             if (vcls == JLREQ_VERT_CJK_BODY && !mark) {
@@ -5406,7 +5510,18 @@ public:
                                 if (gy < y && cwa >= 0)
                                     gy = y;
                             }
+                            // Fork: JFM Phase-3 slot advance (mirrors HarfBuzz) —
+                            // this path measured raw horizontal advances, so
+                            // half-em classes drifted long lines off the grid.
+                            if ( vert_slot_advance > 0
+                                    && vcls != JLREQ_VERT_OTHER ) {
+                                int natural = (have_vmtx && vm.advance)
+                                    ? (int)vm.advance : vert_slot_advance;
+                                vert_slot_advance = getJLReqVertSlotWidth(
+                                        class_ch, _size, natural);
+                            }
                             if (needsVerticalRotation90CW(ch)
+                                    && !vert_subst
                                     && item->bmp_pixelformat != 4) {
                                 // Bearing-correct rotation, ported from the
                                 // HarfBuzz path: 90° CW about the em centre
@@ -5462,7 +5577,7 @@ public:
                             // step is the same value measureText() summed into
                             // word->width, keeping draw and layout in lockstep.
                             if ( is_vertical_ltd )
-                                y += posInfo.width + letter_spacing;
+                                y += vert_slot_advance + letter_spacing;
                             else
                                 x += posInfo.width + letter_spacing + cjk_dx;
                         }
@@ -5598,6 +5713,7 @@ public:
                     int gx = x + FONT_METRIC_TO_PX(kerning) + item->origin_x;
                     int gy = y + _baseline - item->origin_y;
                     bool did_rotate = false;
+                    int vert_slot_advance = w;
                     if (is_vertical_ftd) {
                         // Fork-only: port of the KERNING_MODE_HARFBUZZ
                         // vertical placement (virtual body / vmtx+cwa) — see
@@ -5606,8 +5722,31 @@ public:
                         lChar32 class_ch = orig_ch;
                         JLReqVertClass vcls = getJLReqVertClass(class_ch);
                         bool mark = (flags & LFNT_HINT_VERTICAL_MARK) != 0;
+                        // Fork: pick the font's +vert/+vrt2 GSUB glyph —
+                        // full HarfBuzz does this while shaping; without it
+                        // this path draws the horizontal cmap glyph
+                        // (small-kana vertical alternates etc.), diverging
+                        // from kerning=best.
+                        bool vert_subst = false;
                         VertGlyphMetrics vm;
-                        bool have_vmtx = getVertMetricsForChar(ch, vm);
+                        bool have_vmtx = false;
+                    #if USE_HARFBUZZ==1
+                        LVFreeTypeFace * gface = NULL;
+                        lUInt32 gnom = 0, gvert = 0;
+                        vert_subst = resolveVertGsubGlyph(ch, &gface, &gnom, &gvert)
+                                && gvert != gnom;
+                        if ( vert_subst ) {
+                            LVFontGlyphCacheItem * gitem = gface->getGlyphByIndex(gvert);
+                            if (gitem)
+                                item = gitem;
+                            // vmtx from the substituted glyph (possibly a
+                            // different face's), as in the LIGHT path above.
+                            have_vmtx = gface->_vert_metrics_cache.get(
+                                    gface->_face, (FT_UInt)gvert, vm);
+                        }
+                    #endif
+                        if ( !have_vmtx )
+                            have_vmtx = getVertMetricsForChar(ch, vm);
                         int vadv = (have_vmtx && vm.advance)
                             ? (int)vm.advance : (int)item->advance;
                         if (vcls == JLREQ_VERT_CJK_BODY && !mark) {
@@ -5626,7 +5765,17 @@ public:
                             if (gy < y && cwa >= 0)
                                 gy = y;
                         }
+                        // Fork: JFM Phase-3 slot advance — see the LIGHT path
+                        // above for why half-em classes need it.
+                        if ( vert_slot_advance > 0
+                                && vcls != JLREQ_VERT_OTHER ) {
+                            int natural = (have_vmtx && vm.advance)
+                                ? (int)vm.advance : vert_slot_advance;
+                            vert_slot_advance = getJLReqVertSlotWidth(
+                                    class_ch, _size, natural);
+                        }
                         if (needsVerticalRotation90CW(ch)
+                                && !vert_subst
                                 && item->bmp_pixelformat != 4) {
                             // Bearing-correct rotation, ported from the
                             // HarfBuzz path.
@@ -5676,7 +5825,7 @@ public:
                         // same contract (and same measureText step) as the
                         // LIGHT path above, mirroring HarfBuzz's `y += w`.
                         if ( is_vertical_ftd )
-                            y += w + letter_spacing;
+                            y += vert_slot_advance + letter_spacing;
                         else
                             x += w + letter_spacing;
                     }
